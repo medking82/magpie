@@ -248,7 +248,25 @@ talks to it as it talks to `-p`: stream-json in and out. The helper:
   on Windows 11 26200, magpie-desktop, Claude Code 2.1.289);
 - pastes each user message into the prompt (bracketed paste) and presses
   Enter. A message opening with `/`, `!`, `#` or `&` is pasted after a
-  line break, so it is words, not a command (`pasteable`);
+  line break, so it is words, not a command (`pasteable`). A text block
+  marked `magpie_typed` (`claudetui.TypedKey`) is pasted apart from the
+  words before it, with no line break before it: the gateway marks the
+  user's newest words, apart from the conversation and the caller's
+  reminders, hook output and other texts of its own (`typedWords`).
+  Claude Code 2.1.331 folds a paste longer than 800 characters or with
+  more than `min(rows-10, 2)` line breaks into `<pasted_content>`, and
+  tells the model an instruction inside a larger pasted document is
+  data. A first turn's user words pasted with the caller's CLAUDE.md,
+  memory and hook output, and a Hermes `/steer` at the end of the
+  conversation's paste, were that: the model did nothing, kept to none of
+  the standing rules, or went on with the task it was told to drop
+  (#6335). A shorter one is taken in as typed words. A longer one is
+  still a paste of its own, and the user's own words saying the paste is
+  their message are typed after it (`ownWords`, `folds`). The key is
+  never given to a `-p` run, which would send it on to Anthropic, nor in
+  an aside (`aside`: no tools, or `tool_choice` none), whose last text is
+  its client's ask with what it asks about in it
+  (`TestUserPiecesPasteTypedWordsApart`, `TestClaudeTUITypes…`);
 - pastes a message's images as files (`userPieces`, `writeImage`): each
   base64 image is written to `image-N.<ext>` (0600) in a
   `magpie-claude-images-*` temp folder, and its path is pasted alone,
@@ -1331,7 +1349,18 @@ history to the 1h cache at 2×.
    and answered from all of it. If the run fails to start from it,
    `start` tries once more told whole (`req.told`). With the interactive
    mode off (`-p`), in WSL (no session folder) and with no such reply,
-   the run is told the whole conversation. `retire` takes
+   the run is told the whole conversation. In the interactive mode, the
+   last message's user words (its last text that `userWords` keeps, with
+   images, files and the agent's texts after it left where they were) are
+   typed apart after the conversation, the turns after a replayed reply,
+   or a turn a run goes on with (`renderClaudePromptTyped`,
+   `renderClaudeTurnTyped`): a first turn's words aren't inside the
+   paste of the caller's reminders, nor a `/steer` after tool results
+   another member's run called (a 429 failover, `tool results no run
+   waiting`) one more line of the conversation. A message ending on a
+   tool's result, an aside, and a client that places its own cache marks
+   are told as before.
+   `retire` takes
    the request: an aside of a run that was told tools (`asideOf`: a
    title or summary asked between turns with `tool_choice` none or with
    no tools) doesn't let go of the run the conversation waits in. When it has

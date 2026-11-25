@@ -1252,14 +1252,25 @@ func (b *subscriptionBridge) startRun(ctx context.Context, req *Request, model, 
 	req.clientCache.selected(from == nil)
 	var prompt []map[string]any
 	var prefix cachePrefix
+	// an interactive run is typed the user's newest words apart from what
+	// it is told before them (typedWords); an aside's are its client's
+	typing := claudePrintWhy(req, binary) == "" && !aside(req)
 	if from != nil {
 		// the session's first message has the marks it was started with:
 		// its cache is kept as long as before, whatever the pick is now
 		prefix = from.cachePrefix
-		prompt = renderClaudeTurn(req.Messages[len(req.Messages)-len(from.since):], req.Tools)
+		if typing {
+			prompt = renderClaudeTurnTyped(req.Messages[len(req.Messages)-len(from.since):], req.Tools)
+		} else {
+			prompt = renderClaudeTurn(req.Messages[len(req.Messages)-len(from.since):], req.Tools)
+		}
 	} else {
 		req.cacheTTL = runTTLFor(req, os.Environ())
-		prompt, err = renderClaudePrompt(req)
+		if typing {
+			prompt, err = renderClaudePromptTyped(req)
+		} else {
+			prompt, err = renderClaudePrompt(req)
+		}
 		if err != nil {
 			cleanup()
 			return nil, nil, err
@@ -2179,7 +2190,11 @@ func (b *subscriptionBridge) resume(req *Request, owner string) (*subscriptionRu
 	// the message's id is the turn's, to rewind to if the client gives up
 	// on it
 	turn := newUUID()
-	line, _ := json.Marshal(map[string]any{"type": "user", "uuid": turn, "message": map[string]any{"role": "user", "content": renderClaudeTurn(since, req.Tools)}})
+	content := renderClaudeTurn(since, req.Tools)
+	if run.tui && !aside(req) {
+		content = renderClaudeTurnTyped(since, req.Tools)
+	}
+	line, _ := json.Marshal(map[string]any{"type": "user", "uuid": turn, "message": map[string]any{"role": "user", "content": content}})
 	run.mu.Lock()
 	if run.closed {
 		run.mu.Unlock()
@@ -5955,6 +5970,117 @@ func renderClaudeTurn(msgs []Message, tools []Tool) []map[string]any {
 		text.WriteString("\n\n" + pastCallsNote)
 	}
 	return closeBlocks(blocks, &text)
+}
+
+// typedWords splits off what an interactive run is typed apart from the
+// rest of what it is told: the user's newest words, the last text of the
+// last message that is the user's (userWords), and the rest of the
+// messages. Images, files and the agent's texts after them (a reminder, a
+// hook's notice) stay where they were; a message ending on a tool's
+// result has no newest words. A text that holds the agent's words before
+// the user's, as a Codex app context or a reminder before "## My
+// request", is split where the user's begin; one with the agent's words
+// after the user's is left whole.
+//
+// Told in one paste with the conversation, those words were one more line
+// of it. Claude Code wraps a long paste in <pasted_content> and tells the
+// model to follow an instruction inside one only where the user's own
+// message asks for it, an instruction inside a larger pasted document
+// never. On a first turn the caller's CLAUDE.md, memory and hook output
+// (its reminders) and the user's own message were that one paste, and the
+// model took the whole message for pasted data and did nothing, or kept
+// to none of the standing rules (#6335). A Hermes /steer, which Hermes
+// sends as a user message after the turn's tool results, reached a run
+// started anew for them (the calls' run was another member's: a 429
+// failover) at the end of that paste, and the model went on with the task
+// the user had told it to drop.
+//
+// An aside's last text is its client's ask, often with the words it asks
+// about in it (a title or a summary of a transcript), never typed apart
+// (startRun, resume).
+func typedWords(msgs []Message) (rest []Message, words string, ok bool) {
+	n := len(msgs)
+	if n == 0 || msgs[n-1].Role != "user" {
+		return msgs, "", false
+	}
+	last := msgs[n-1]
+	for k := len(last.Parts) - 1; k >= 0; k-- {
+		p := last.Parts[k]
+		if p.Kind == Image || p.Kind == File {
+			continue
+		}
+		if p.Kind != Text {
+			return msgs, "", false
+		}
+		w := userWords(p.Text)
+		if w == "" || agentNotice(p.Text) {
+			continue
+		}
+		t := strings.TrimSpace(p.Text)
+		if !strings.HasSuffix(t, w) {
+			return msgs, "", false
+		}
+		parts := slices.Clone(last.Parts[:k])
+		if before := strings.TrimSpace(strings.TrimSuffix(t, w)); before != "" {
+			p.Text = before
+			parts = append(parts, p)
+		}
+		parts = append(parts, last.Parts[k+1:]...)
+		rest = slices.Clone(msgs[:n-1])
+		if len(parts) > 0 {
+			last.Parts = parts
+			rest = append(rest, last)
+		}
+		return rest, w, true
+	}
+	return msgs, "", false
+}
+
+// typedBlock is words as the interactive helper pastes them apart
+// (claudetui.TypedKey). Only an interactive run is given one: -p would
+// send the key on to Anthropic.
+func typedBlock(words string) map[string]any {
+	return map[string]any{"type": "text", "text": words, claudetui.TypedKey: true}
+}
+
+// renderClaudePromptTyped is renderClaudePrompt for a new interactive run:
+// the conversation, then the user's newest words typed apart (typedWords).
+// The turn to answer begins where it did; when it is those words alone,
+// every message before them is history, as a replayed transcript tells
+// them (replaySession). A first message that is those words alone is
+// typed them alone. A client's own cache marks are placed on the parts
+// they were sent on, so their conversation is told as before.
+func renderClaudePromptTyped(req *Request) ([]map[string]any, error) {
+	rest, words, ok := typedWords(req.Messages)
+	if !ok || req.clientCache != nil {
+		return renderClaudePrompt(req)
+	}
+	before := *req
+	before.Messages = rest
+	blocks, err := renderClaudePromptAt(&before, min(historyEnd(req.Messages), len(rest)))
+	if err != nil {
+		return nil, err
+	}
+	if len(rest) == 0 && len(blocks) == 1 && blocks[0]["text"] == "[continue]" {
+		// nothing before the words: closeBlocks' stand-in for an empty prompt
+		blocks = nil
+	}
+	return append(blocks, typedBlock(words)), nil
+}
+
+// renderClaudeTurnTyped is renderClaudeTurn for an interactive run: the
+// messages since a reply, labeled as there, then the user's newest words
+// typed apart (typedWords). The user's words alone, or after a tool result
+// of the run's own, go as they did.
+func renderClaudeTurnTyped(msgs []Message, tools []Tool) []map[string]any {
+	rest, words, ok := typedWords(msgs)
+	if !ok {
+		return renderClaudeTurn(msgs, tools)
+	}
+	if len(rest) == 0 {
+		return []map[string]any{typedBlock(words)}
+	}
+	return append(renderClaudeTurn(rest, tools), typedBlock(words))
 }
 
 // renderParts writes the parts as text, a call of one of the offered tools

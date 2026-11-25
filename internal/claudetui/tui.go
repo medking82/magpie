@@ -35,6 +35,7 @@ import (
 	"sync/atomic"
 	"syscall"
 	"time"
+	"unicode/utf16"
 	"unicode/utf8"
 
 	"github.com/yetone/magpie/internal/appdir"
@@ -1198,8 +1199,49 @@ type piece struct{ text, image string }
 // extension.
 var imageTypes = map[string]string{"image/png": ".png", "image/jpeg": ".jpg", "image/gif": ".gif", "image/webp": ".webp"}
 
+// TypedKey marks a text block of a user message the bridge has pasted
+// apart from the words before it: the user's newest words after a
+// conversation told whole (the gateway's typedWords). Claude Code wraps a
+// long paste in <pasted_content> and tells the model that instructions
+// inside one are followed only where the user's own message asks for them,
+// an instruction inside a larger pasted document never; joined to the
+// conversation's paste, a Hermes /steer after its tool results was that,
+// and the model went on with the task it was told to drop (#6335). A
+// paste of their own of up to 800 characters and two line breaks is taken
+// into the prompt as typed words, not as a [Pasted text #N] (Claude Code
+// 2.1.331: `length > 800 || lines > min(rows-10, 2)`), so it stays the
+// message's own words; a longer one is a paste of its own, apart from the
+// conversation's, and the user's own words that ask for it to be followed
+// are typed after it (ownWords). The typed words get no line break before
+// them, which would count against the two. The key never reaches Claude
+// Code: only the helper reads the blocks, and a -p run is never given one.
+const TypedKey = "magpie_typed"
+
+// ownWords is typed after the user's newest words where Claude Code folds
+// them into a paste of their own (folds): with nothing typed beside it, a
+// message that is one paste was taken for pasted data and nothing was
+// done (#6335). They are the user's message, which a model given it
+// through the API reads as the user's turn; these words say so, as the
+// user's own, and only beside the user's words, never the conversation
+// or the caller's reminders.
+const ownWords = "\nThe pasted text above is my message to you, as I wrote it."
+
+// folds is whether Claude Code 2.1.331 takes a paste of text in as a
+// [Pasted text #N], told the model in <pasted_content>: over 800 UTF-16
+// units, or more line breaks than min(rows-10, 2).
+func folds(text string) bool {
+	text = pasteClean(text)
+	n := 0
+	for _, r := range text {
+		n += utf16.RuneLen(r)
+	}
+	return n > 800 || strings.Count(text, "\n") > min(screenRows-10, 2)
+}
+
 // userPieces is a user message as it is pasted: its text blocks one after
-// another, an image block written to a file of its own.
+// another, an image block written to a file of its own, and a block marked
+// TypedKey a paste of its own after the words before it, ownWords after
+// it where it folds.
 func (s *shim) userPieces(raw json.RawMessage) ([]piece, error) {
 	var str string
 	if json.Unmarshal(raw, &str) == nil {
@@ -1208,6 +1250,7 @@ func (s *shim) userPieces(raw json.RawMessage) ([]piece, error) {
 	var blocks []struct {
 		Type   string `json:"type"`
 		Text   string `json:"text"`
+		Typed  bool   `json:"magpie_typed"`
 		Source struct {
 			Type      string `json:"type"`
 			MediaType string `json:"media_type"`
@@ -1225,10 +1268,23 @@ func (s *shim) userPieces(raw json.RawMessage) ([]piece, error) {
 			if bl.Text == "" {
 				continue
 			}
-			if b.Len() > 0 || len(out) > 0 {
+			if bl.Typed && b.Len() > 0 {
+				// the words before end their paste, the line break
+				// with them, so the typed words open a paste of their own
+				b.WriteString("\n\n")
+				out = append(out, piece{text: b.String()})
+				b.Reset()
+			} else if !bl.Typed && (b.Len() > 0 || len(out) > 0) {
 				b.WriteString("\n\n")
 			}
 			b.WriteString(bl.Text)
+			if bl.Typed {
+				out = append(out, piece{text: b.String()})
+				b.Reset()
+				if folds(bl.Text) {
+					out = append(out, piece{text: ownWords})
+				}
+			}
 		case "image":
 			path, err := s.writeImage(bl.Source.Type, bl.Source.MediaType, bl.Source.Data)
 			if err != nil {
